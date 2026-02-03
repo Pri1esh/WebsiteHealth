@@ -1,5 +1,8 @@
-flask==3.0.0
-pandas==2.1.4
-requests==2.31.0
-openpyxl==3.1.2
-xlrd==2.0.1
+flask
+flask-cors
+gunicorn
+pandas
+requests
+selenium
+selenium-stealth
+webdriver-manager
