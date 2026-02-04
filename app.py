@@ -1,13 +1,17 @@
 import threading
 import time
+import requests
+import pandas as pd
 import os
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium_stealth import stealth
 import urllib3
 from flask_cors import CORS  # Add this
-from pathlib import Path
-from openpyxl import load_workbook
-
 
 urllib3.disable_warnings()
 app = Flask(__name__)
@@ -28,233 +32,216 @@ monitoring_results = {
 
 results_lock = threading.Lock()
 
-def load_websites_from_excel():
-    """Load websites from Excel using openpyxl (no pandas) - Optimized for Render.com"""
-    try:
-        # Get the directory of the current script
-        current_dir = Path(__file__).parent.resolve()
 
-        # Define possible paths (prioritize different locations)
+def load_websites_from_excel():
+    """Load websites from Excel"""
+    try:
         possible_paths = [
-            current_dir / 'Adani-BUWise-Websites.xlsx',  # Same directory as script
-            current_dir / 'data' / 'Adani-BUWise-Websites.xlsx',  # data/ subfolder
-            Path('/app/Adani-BUWise-Websites.xlsx'),  # Render common mount
-            Path('Adani-BUWise-Websites.xlsx'),  # Current working dir
-            Path('/data/Adani-BUWise-Websites.xlsx'),  # Persistent disk
+            os.path.join(os.path.dirname(__file__), 'Adani-BUWise-Websites.xlsx'),
+            'Adani-BUWise-Websites.xlsx',
+            'upload/Adani-BUWise-Websites.xlsx'
         ]
 
-        excel_file = None
-        used_path = None
-
+        df = None
         for path in possible_paths:
-            if path.exists():
-                excel_file = path
-                used_path = path
-                print(f"✓ Found Excel file at: {path}")
+            if os.path.exists(path):
+                df = pd.read_excel(path)
                 break
 
-        if excel_file is None:
-            print("⚠ Excel file not found in any location, using demo data")
+        if df is None:
             return get_demo_websites()
-
-        # Load workbook using openpyxl (lightweight, no pandas needed)
-        # read_only=True is faster and uses less memory
-        wb = load_workbook(filename=str(excel_file), read_only=True, data_only=True)
-
-        # Get the first sheet (or specify sheet name: wb['Sheet1'])
-        ws = wb.active
 
         websites = []
+        for _, row in df.iterrows():
+            bu = str(row.get('BU', '')).strip()
+            cell = str(row.get('Websites', '')).strip()
 
-        # Get header row to find column indices
-        headers = {}
-        header_row = next(ws.iter_rows(values_only=True))
-
-        for idx, cell_value in enumerate(header_row):
-            if cell_value:
-                headers[str(cell_value).strip().upper()] = idx
-
-        # Check required columns exist
-        if 'BU' not in headers or 'WEBSITES' not in headers:
-            print("⚠ Required columns 'BU' or 'Websites' not found")
-            wb.close()
-            return get_demo_websites()
-
-        bu_col = headers['BU']
-        websites_col = headers['WEBSITES']
-
-        # Iterate through data rows (skip header)
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            try:
-                bu = str(row[bu_col]).strip() if row[bu_col] else ''
-                cell = str(row[websites_col]).strip() if row[websites_col] else ''
-
-                # Skip empty rows
-                if not cell or cell.lower() in ['nan', 'none', '']:
-                    continue
-
-                # Normalize line endings and split by newlines or commas
-                cell = cell.replace('\r\n', '\n').replace('\r', '\n')
-                raw_urls = []
-
-                for part in cell.split('\n'):
-                    raw_urls.extend([u.strip() for u in part.split(',') if u.strip()])
-
-                # Process each URL
-                for url in raw_urls:
-                    if not url or url.lower() in ['nan', 'none']:
-                        continue
-
-                    # Ensure proper URL format
-                    if not url.startswith(('http://', 'https://')):
-                        url = 'https://' + url
-                    url = url.replace(' ', '').rstrip('/')
-
-                    # Clean name
-                    name = url.replace('https://', '').replace('http://', '').replace('www.', '')
-
-                    websites.append({
-                        'bu': bu,
-                        'url': url,
-                        'name': name
-                    })
-
-            except Exception as row_error:
-                print(f"⚠ Error processing row: {row_error}")
+            if not cell or cell.lower() in ['nan', 'none']:
                 continue
 
-        # Close workbook to free memory
-        wb.close()
+            cell = cell.replace('\r\n', '\n').replace('\r', '\n')
+            raw_urls = []
 
-        print(f"✓ Successfully loaded {len(websites)} websites from {used_path}")
+            for part in cell.split('\n'):
+                raw_urls.extend([u.strip() for u in part.split(',') if u.strip()])
+
+            for url in raw_urls:
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
+                url = url.replace(' ', '').rstrip('/')
+
+                websites.append({
+                    'bu': bu,
+                    'url': url,
+                    'name': url.replace('https://', '').replace('http://', '').replace('www.', '')
+                })
+
         return websites
-
     except Exception as e:
-        print(f"✗ Error reading Excel: {e}")
-        import traceback
-        traceback.print_exc()
+        print("Error reading Excel:", e)
         return get_demo_websites()
 
 
-def get_demo_websites():
-    """Return demo websites when Excel is not available"""
-    return [
-        {
-            'bu': 'Demo BU',
-            'url': 'https://example.com',
-            'name': 'example.com'
-        }
-    ]
-
-
-# Global cache to track which sites need Selenium
-selenium_required = set()
-
-
 def check_website(site_info):
-    """Check website using curl_cffi with free proxy fallback"""
-    from curl_cffi import requests
-    from datetime import datetime
-    import random
+    """Check website - fast method first, Selenium fallback if blocked"""
+    import requests
+    import urllib3
+    urllib3.disable_warnings()
 
     url = site_info['url']
 
-    # List of free proxies (rotate these)
-    free_proxies = [
-        "http://43.153.113.214:8080",  # Public proxy - replace with fresh ones
-        "http://20.235.104.105:3128",
-        # Add more from: https://free-proxy-list.net/
-    ]
-
-    # Try without proxy first (might work for some sites)
+    # Step 1: Try fast requests method
     try:
-        resp = requests.get(
-            url,
-            impersonate="chrome120",
-            timeout=15,
-            verify=False
-        )
-        if resp.status_code == 200:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
+
+        # SUCCESS: 2xx or 3xx (redirects)
+        if 200 <= response.status_code < 400:
             return {
                 'success': True,
-                'status_code': resp.status_code,
+                'status_code': response.status_code,
                 'url': url,
                 'bu': site_info['bu'],
                 'name': site_info['name'],
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'error': None,
-                'method': 'direct'
+                'method': 'fast'
             }
-    except Exception:
+
+        # CLIENT ERRORS: 4xx (except some special cases)
+        # 403 Forbidden = FAIL (site is blocking us, but we can't access it)
+        # 401 Unauthorized = FAIL
+        # 404 Not Found = FAIL
+        # 405 Method Not Allowed = try GET instead of HEAD, but still fail if persists
+
+        if response.status_code in [403, 401, 404, 405, 406, 407, 408, 409, 410, 429]:
+            return {
+                'success': False,
+                'status_code': response.status_code,
+                'url': url,
+                'bu': site_info['bu'],
+                'name': site_info['name'],
+                'error': f'HTTP {response.status_code} - {"Forbidden" if response.status_code == 403 else "Client Error"}',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+
+        # SERVER ERRORS: 5xx (site is down)
+        if response.status_code >= 500:
+            return {
+                'success': False,
+                'status_code': response.status_code,
+                'url': url,
+                'bu': site_info['bu'],
+                'name': site_info['name'],
+                'error': f'HTTP {response.status_code} - Server Error',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+
+    except requests.exceptions.Timeout:
+        return {
+            'success': False,
+            'status_code': 0,
+            'url': url,
+            'bu': site_info['bu'],
+            'name': site_info['name'],
+            'error': 'Timeout',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+    except Exception as e:
+        # Continue to Selenium for connection errors, SSL errors, etc.
         pass
 
-    # Try with proxy
-    for proxy in random.sample(free_proxies, len(free_proxies)):
-        try:
-            proxies = {
-                "http": proxy,
-                "https": proxy
+    # Step 2: Use Selenium for sites that might need JavaScript rendering
+    # BUT: We should NOT use Selenium for 403 errors - if requests got 403,
+    # Selenium will likely also be blocked or get a challenge page
+
+    print(f"   Trying Selenium for: {site_info['name']}")
+
+    try:
+        options = Options()
+        options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option('useAutomationExtension', False)
+
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
+
+        stealth(driver,
+                languages=["en-US", "en"],
+                vendor="Google Inc.",
+                platform="Win32",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True)
+
+        driver.set_page_load_timeout(25)
+        driver.get(url)
+
+        # Check if we hit a cloudflare/verification page
+        page_title = driver.title.lower()
+        page_source = driver.page_source.lower()
+
+        # Common indicators of being blocked
+        blocked_indicators = [
+            'access denied', '403 forbidden', 'blocked',
+            'cloudflare', 'captcha', 'verification',
+            'security check', 'ddos protection'
+        ]
+
+        is_blocked = any(indicator in page_title or indicator in page_source
+                         for indicator in blocked_indicators)
+
+        if is_blocked:
+            driver.quit()
+            return {
+                'success': False,
+                'status_code': 403,
+                'url': url,
+                'bu': site_info['bu'],
+                'name': site_info['name'],
+                'error': 'Blocked by WAF/Cloudflare',
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'method': 'selenium-blocked'
             }
 
-            resp = requests.get(
-                url,
-                impersonate="chrome120",
-                timeout=20,
-                verify=False,
-                proxies=proxies
-            )
+        title = driver.title
+        driver.quit()
 
-            if resp.status_code == 200:
-                return {
-                    'success': True,
-                    'status_code': resp.status_code,
-                    'url': url,
-                    'bu': site_info['bu'],
-                    'name': site_info['name'],
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'error': None,
-                    'method': 'proxy',
-                    'proxy_used': proxy
-                }
-        except Exception:
-            continue
+        return {
+            'success': True,
+            'status_code': 200,
+            'url': url,
+            'bu': site_info['bu'],
+            'name': site_info['name'],
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'method': 'selenium',
+            'title': title[:30]
+        }
 
-    # All attempts failed
-    return {
-        'success': False,
-        'status_code': 0,
-        'url': url,
-        'bu': site_info['bu'],
-        'name': site_info['name'],
-        'error': 'Blocked by anti-bot (proxy needed)',
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
+    except Exception as e:
+        try:
+            driver.quit()
+        except:
+            pass
 
+        return {
+            'success': False,
+            'status_code': 0,
+            'url': url,
+            'bu': site_info['bu'],
+            'name': site_info['name'],
+            'error': 'Selenium failed',
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
 
-def success_response(url, site_info, status_code):
-    from datetime import datetime
-    return {
-        'success': True,
-        'status_code': status_code,
-        'url': url,
-        'bu': site_info['bu'],
-        'name': site_info['name'],
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        'error': None
-    }
-
-
-def fail_response(url, site_info, error):
-    from datetime import datetime
-    return {
-        'success': False,
-        'status_code': 0,
-        'url': url,
-        'bu': site_info['bu'],
-        'name': site_info['name'],
-        'error': error,
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
 
 def get_demo_websites():
     return [{'bu': 'Demo', 'url': 'https://www.google.com', 'name': 'google.com'}]
