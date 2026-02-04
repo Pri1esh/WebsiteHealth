@@ -5,6 +5,7 @@ from flask import Flask, render_template, jsonify, request
 from datetime import datetime
 import urllib3
 from flask_cors import CORS  # Add this
+from pathlib import Path
 from openpyxl import load_workbook
 
 
@@ -28,40 +29,122 @@ monitoring_results = {
 results_lock = threading.Lock()
 
 def load_websites_from_excel():
+    """Load websites from Excel using openpyxl (no pandas) - Optimized for Render.com"""
     try:
-        path = os.path.join(os.path.dirname(__file__), 'Adani-BUWise-Websites.xlsx')
-        if not os.path.exists(path):
+        # Get the directory of the current script
+        current_dir = Path(__file__).parent.resolve()
+
+        # Define possible paths (prioritize different locations)
+        possible_paths = [
+            current_dir / 'Adani-BUWise-Websites.xlsx',  # Same directory as script
+            current_dir / 'data' / 'Adani-BUWise-Websites.xlsx',  # data/ subfolder
+            Path('/app/Adani-BUWise-Websites.xlsx'),  # Render common mount
+            Path('Adani-BUWise-Websites.xlsx'),  # Current working dir
+            Path('/data/Adani-BUWise-Websites.xlsx'),  # Persistent disk
+        ]
+
+        excel_file = None
+        used_path = None
+
+        for path in possible_paths:
+            if path.exists():
+                excel_file = path
+                used_path = path
+                print(f"✓ Found Excel file at: {path}")
+                break
+
+        if excel_file is None:
+            print("⚠ Excel file not found in any location, using demo data")
             return get_demo_websites()
 
-        wb = load_workbook(path, data_only=True)
+        # Load workbook using openpyxl (lightweight, no pandas needed)
+        # read_only=True is faster and uses less memory
+        wb = load_workbook(filename=str(excel_file), read_only=True, data_only=True)
+
+        # Get the first sheet (or specify sheet name: wb['Sheet1'])
         ws = wb.active
 
         websites = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            bu = str(row[0] or '').strip()
-            sites = str(row[1] or '').strip()
 
-            if not bu or not sites or sites.lower() in ['nan', 'none']:
+        # Get header row to find column indices
+        headers = {}
+        header_row = next(ws.iter_rows(values_only=True))
+
+        for idx, cell_value in enumerate(header_row):
+            if cell_value:
+                headers[str(cell_value).strip().upper()] = idx
+
+        # Check required columns exist
+        if 'BU' not in headers or 'WEBSITES' not in headers:
+            print("⚠ Required columns 'BU' or 'Websites' not found")
+            wb.close()
+            return get_demo_websites()
+
+        bu_col = headers['BU']
+        websites_col = headers['WEBSITES']
+
+        # Iterate through data rows (skip header)
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            try:
+                bu = str(row[bu_col]).strip() if row[bu_col] else ''
+                cell = str(row[websites_col]).strip() if row[websites_col] else ''
+
+                # Skip empty rows
+                if not cell or cell.lower() in ['nan', 'none', '']:
+                    continue
+
+                # Normalize line endings and split by newlines or commas
+                cell = cell.replace('\r\n', '\n').replace('\r', '\n')
+                raw_urls = []
+
+                for part in cell.split('\n'):
+                    raw_urls.extend([u.strip() for u in part.split(',') if u.strip()])
+
+                # Process each URL
+                for url in raw_urls:
+                    if not url or url.lower() in ['nan', 'none']:
+                        continue
+
+                    # Ensure proper URL format
+                    if not url.startswith(('http://', 'https://')):
+                        url = 'https://' + url
+                    url = url.replace(' ', '').rstrip('/')
+
+                    # Clean name
+                    name = url.replace('https://', '').replace('http://', '').replace('www.', '')
+
+                    websites.append({
+                        'bu': bu,
+                        'url': url,
+                        'name': name
+                    })
+
+            except Exception as row_error:
+                print(f"⚠ Error processing row: {row_error}")
                 continue
 
-            for url in sites.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
-                url = url.strip()
-                if not url or url.lower() in ['nan', 'none']:
-                    continue
-                if not url.startswith('http'):
-                    url = 'https://' + url
-                url = url.replace(' ', '').rstrip('/')
+        # Close workbook to free memory
+        wb.close()
 
-                websites.append({
-                    'bu': bu,
-                    'url': url,
-                    'name': url.replace('https://', '').replace('http://', '').replace('www.', '')
-                })
-
+        print(f"✓ Successfully loaded {len(websites)} websites from {used_path}")
         return websites
+
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"✗ Error reading Excel: {e}")
+        import traceback
+        traceback.print_exc()
         return get_demo_websites()
+
+
+def get_demo_websites():
+    """Return demo websites when Excel is not available"""
+    return [
+        {
+            'bu': 'Demo BU',
+            'url': 'https://example.com',
+            'name': 'example.com'
+        }
+    ]
 
 
 def check_website(site_info):
