@@ -1,15 +1,8 @@
 import threading
 import time
-import requests
-import pandas as pd
 import os
 from flask import Flask, render_template, jsonify, request
 from datetime import datetime
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium_stealth import stealth
 import urllib3
 from flask_cors import CORS  # Add this
 from openpyxl import load_workbook
