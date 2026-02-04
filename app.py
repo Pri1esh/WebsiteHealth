@@ -12,6 +12,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium_stealth import stealth
 import urllib3
 from flask_cors import CORS  # Add this
+from openpyxl import load_workbook
+
 
 urllib3.disable_warnings()
 app = Flask(__name__)
@@ -32,41 +34,28 @@ monitoring_results = {
 
 results_lock = threading.Lock()
 
-
 def load_websites_from_excel():
-    """Load websites from Excel"""
     try:
-        possible_paths = [
-            os.path.join(os.path.dirname(__file__), 'Adani-BUWise-Websites.xlsx'),
-            'Adani-BUWise-Websites.xlsx',
-            'upload/Adani-BUWise-Websites.xlsx'
-        ]
-
-        df = None
-        for path in possible_paths:
-            if os.path.exists(path):
-                df = pd.read_excel(path)
-                break
-
-        if df is None:
+        path = os.path.join(os.path.dirname(__file__), 'Adani-BUWise-Websites.xlsx')
+        if not os.path.exists(path):
             return get_demo_websites()
 
-        websites = []
-        for _, row in df.iterrows():
-            bu = str(row.get('BU', '')).strip()
-            cell = str(row.get('Websites', '')).strip()
+        wb = load_workbook(path, data_only=True)
+        ws = wb.active
 
-            if not cell or cell.lower() in ['nan', 'none']:
+        websites = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            bu = str(row[0] or '').strip()
+            sites = str(row[1] or '').strip()
+
+            if not bu or not sites or sites.lower() in ['nan', 'none']:
                 continue
 
-            cell = cell.replace('\r\n', '\n').replace('\r', '\n')
-            raw_urls = []
-
-            for part in cell.split('\n'):
-                raw_urls.extend([u.strip() for u in part.split(',') if u.strip()])
-
-            for url in raw_urls:
-                if not url.startswith(('http://', 'https://')):
+            for url in sites.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+                url = url.strip()
+                if not url or url.lower() in ['nan', 'none']:
+                    continue
+                if not url.startswith('http'):
                     url = 'https://' + url
                 url = url.replace(' ', '').rstrip('/')
 
@@ -78,7 +67,7 @@ def load_websites_from_excel():
 
         return websites
     except Exception as e:
-        print("Error reading Excel:", e)
+        print(f"Error: {e}")
         return get_demo_websites()
 
 
