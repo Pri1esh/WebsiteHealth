@@ -12,6 +12,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from selenium_stealth import stealth
 import urllib3
 from flask_cors import CORS  # Add this
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings()
 app = Flask(__name__)
@@ -19,7 +20,6 @@ CORS(app)  # Enable CORS for all routes
 
 # Global shared state
 CHECK_INTERVAL = 15 * 60
-MAX_RETRIES = 3
 
 monitoring_results = {
     'total': 0,
@@ -95,7 +95,19 @@ def check_website(site_info):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        for attempt in range(3):  # retry 3 times internally
+            try:
+                response = requests.get(
+                    url,
+                    headers=headers,
+                    timeout=20,  # increased from 10 → 20
+                    verify=False
+                )
+                break  # success, exit retry loop
+            except requests.exceptions.Timeout:
+                if attempt == 2:
+                    raise
+                time.sleep(2)  # small wait before retry
 
         # SUCCESS: 2xx or 3xx (redirects)
         if 200 <= response.status_code < 400:
@@ -248,7 +260,7 @@ def get_demo_websites():
 
 
 def monitor_websites():
-    """Main monitoring loop"""
+    """Main monitoring loop with multithreading"""
     global monitoring_results
 
     monitoring_results['is_running'] = True
@@ -260,38 +272,54 @@ def monitor_websites():
             monitoring_results['total'] = len(websites)
             monitoring_results['checked'] = 0
 
-        print(f"\n🔍 Checking {len(websites)} websites...")
+        print(f"\n🔍 Checking {len(websites)} websites using multithreading...")
 
-        for i, site in enumerate(websites, start=1):
-            if not monitoring_results['is_running']:
-                break
+        # Use thread pool for parallel website checks
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {
+                executor.submit(check_website, site): site
+                for site in websites
+            }
 
-            result = check_website(site)
+            for i, future in enumerate(as_completed(futures), start=1):
+                if not monitoring_results['is_running']:
+                    break
 
-            with results_lock:
-                monitoring_results['checked'] = i
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print("Thread error:", e)
+                    continue
 
-                if not result['success']:
-                    existing = next((f for f in monitoring_results['failed'] if f['url'] == result['url']), None)
-                    if not existing:
-                        result['retry_count'] = 0
-                        monitoring_results['failed'].append(result)
-                else:
-                    # Remove from failed if recovered
-                    monitoring_results['failed'] = [f for f in monitoring_results['failed'] if f['url'] != result['url']]
+                with results_lock:
+                    monitoring_results['checked'] = i
 
-            time.sleep(0.5)
+                    if not result['success']:
+                        existing = next(
+                            (f for f in monitoring_results['failed']
+                             if f['url'] == result['url']),
+                            None
+                        )
+                        if not existing:
+                            result['retry_count'] = 0
+                            monitoring_results['failed'].append(result)
+                    else:
+                        # Remove recovered sites from failed list
+                        monitoring_results['failed'] = [
+                            f for f in monitoring_results['failed']
+                            if f['url'] != result['url']
+                        ]
 
         with results_lock:
             monitoring_results['last_check'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         print(f"✅ Cycle done. Failed: {len(monitoring_results['failed'])}")
 
-        # Sleep 15 minutes
-        for _ in range(CHECK_INTERVAL):
-            if not monitoring_results['is_running']:
-                break
+        # Wait CHECK_INTERVAL seconds before next cycle
+        sleep_seconds = CHECK_INTERVAL
+        while sleep_seconds > 0 and monitoring_results['is_running']:
             time.sleep(1)
+            sleep_seconds -= 1
 
     print("🛑 Monitoring stopped")
 
@@ -356,17 +384,9 @@ def retry_website():
             return jsonify({'success': False, 'error': 'Site not found'}), 404
 
         retry_count = site_info.get('retry_count', 0)
-        if retry_count >= MAX_RETRIES:
-            return jsonify({
-                'success': False,
-                'error': f'Max retries ({MAX_RETRIES}) reached',
-                'retry_count': retry_count
-            }), 429
-
-        monitoring_results['retry_in_progress'] = True
 
     # Perform retry outside lock
-    print(f"🔄 Retrying: {url} (attempt {retry_count + 1}/{MAX_RETRIES})")
+    print(f"🔄 Retrying: {url} (attempt {retry_count + 1})")
     result = check_website(site_info)
 
     with results_lock:
@@ -389,7 +409,6 @@ def retry_website():
                 'success': False,
                 'error': result.get('error', 'Check failed'),
                 'retry_count': site_info['retry_count'],
-                'max_retries': MAX_RETRIES
             })
 
 
@@ -411,10 +430,6 @@ def retry_all_failed():
 
     for site in failed_sites:
         retry_count = site.get('retry_count', 0)
-
-        if retry_count >= MAX_RETRIES:
-            results.append({'url': site['url'], 'skipped': True, 'reason': 'Max retries'})
-            continue
 
         result = check_website(site)
 

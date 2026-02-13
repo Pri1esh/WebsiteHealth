@@ -8,3 +8,4 @@ selenium-stealth==1.0.6
 webdriver-manager==4.0.1
 gunicorn==21.2.0
 urllib3==2.1.0
+waitress
